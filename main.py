@@ -2,13 +2,14 @@ import os
 import re
 import ast
 import math
-import asyncio
-from typing import Literal, Optional, Union
+import traceback
+from typing import Literal, Optional, Any, Dict
 
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
+
 import google.generativeai as genai
 
 # ---------------------------------------------------------
@@ -19,25 +20,35 @@ load_dotenv()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 if not GEMINI_API_KEY:
-    # NOTE: If this is missing on Render, /health will still run only if app starts.
-    # But we crash here to make it obvious.
-    raise RuntimeError("GEMINI_API_KEY not set in environment variables")
+    raise RuntimeError("GEMINI_API_KEY not set in environment")
 
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash").strip()
 genai.configure(api_key=GEMINI_API_KEY)
 
-# Gemini model
-MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
-model = genai.GenerativeModel(MODEL_NAME)
+# Create model
+model = genai.GenerativeModel(GEMINI_MODEL)
 
-# timeouts (seconds)
-GEMINI_TIMEOUT_SEC = int(os.getenv("GEMINI_TIMEOUT_SEC", "25"))
-RECONSIDER_TIMEOUT_SEC = int(os.getenv("RECONSIDER_TIMEOUT_SEC", "20"))
+app = FastAPI(title="QueryX Backend", version="1.0.0")
 
-app = FastAPI()
+# ---------------------------------------------------------
+# MIDDLEWARE: normalize double slashes in path
+# (frontend BACKEND_URL endswith '/' => //ask-text, //ask-image)
+# ---------------------------------------------------------
+@app.middleware("http")
+async def normalize_path_middleware(request: Request, call_next):
+    scope = request.scope
+    path = scope.get("path", "")
+    if "//" in path:
+        scope["path"] = re.sub(r"/{2,}", "/", path)
+    return await call_next(request)
 
+# ---------------------------------------------------------
+# CORS
+# ---------------------------------------------------------
+# In prod you can restrict. For beta keep open.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],          # beta
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -64,7 +75,7 @@ class AnswerResponse(BaseModel):
 
 
 # ---------------------------------------------------------
-# SAFE PYTHON CALC HELPERS
+# SAFE MATH EVAL (NO SANDBOX EXEC, ONLY MATH EXPRESSIONS)
 # ---------------------------------------------------------
 
 ALLOWED_NAMES = {
@@ -99,81 +110,72 @@ ALLOWED_NODES = (
     ast.Mod,
 )
 
-
 def safe_eval(expr: str) -> Optional[float]:
     """
-    Safely evaluate a mathematical expression.
-    Only arithmetic + allowed math functions.
+    Evaluate ONLY math expressions safely.
+    Returns float or None.
     """
-    try:
-        expr = expr.strip()
-        if not expr:
-            return None
+    if not expr:
+        return None
 
+    expr = expr.strip()
+
+    # quick reject suspicious
+    if any(x in expr for x in ["__", "import", "exec", "eval", "open", "os.", "sys.", ";", "{", "}", "[", "]"]):
+        return None
+
+    try:
         tree = ast.parse(expr, mode="eval")
 
         for node in ast.walk(tree):
             if not isinstance(node, ALLOWED_NODES):
                 return None
+
             if isinstance(node, ast.Name) and node.id not in ALLOWED_NAMES:
                 return None
+
             if isinstance(node, ast.Call):
-                # allow only function calls like sqrt(x), sin(x)
+                # only allow calling allowed names like sqrt(...)
                 if not isinstance(node.func, ast.Name):
                     return None
                 if node.func.id not in ALLOWED_NAMES:
                     return None
 
-        val = eval(
-            compile(tree, "<expr>", "eval"),
-            {"__builtins__": {}},
-            ALLOWED_NAMES,
-        )
-        if isinstance(val, (int, float)) and math.isfinite(val):
+        val = eval(compile(tree, "<expr>", "eval"), {"__builtins__": {}}, ALLOWED_NAMES)
+        if isinstance(val, (int, float)):
             return float(val)
         return None
     except Exception:
         return None
 
 
-def extract_candidate_expression(text: str) -> Optional[str]:
+def looks_like_plain_math_question(q: str) -> bool:
     """
-    Try to extract a numeric expression to verify using python.
-    We take LAST reasonable expression-like chunk.
+    If question is basically math expression like: 2+3, (2*3)+4, 1/2 + 3/4
     """
-    if not text:
-        return None
-
-    # Remove LaTeX blocks to avoid capturing random stuff inside $$ $$
-    cleaned = re.sub(r"\$\$.*?\$\$", " ", text, flags=re.DOTALL)
-    cleaned = re.sub(r"\$.*?\$", " ", cleaned, flags=re.DOTALL)
-
-    # Candidates: numbers and arithmetic operators
-    candidates = re.findall(r"[-+*/().0-9eE]+", cleaned)
-    if not candidates:
-        return None
-
-    # Pick last candidate with at least a digit
-    for cand in reversed(candidates):
-        if re.search(r"\d", cand):
-            return cand
-    return None
+    q = q.strip()
+    # allow digits operators spaces parentheses decimal pi e
+    return bool(re.fullmatch(r"[0-9\.\s\+\-\*\/\^\(\)eEpi]+", q))
 
 
 # ---------------------------------------------------------
-# PROMPT HELPERS
+# GEMINI HELPERS
 # ---------------------------------------------------------
 
 def build_system_prompt(level: str, style: str, language: str) -> str:
     if level == "advanced":
-        level_line = "Explain with JEE/NEET depth. Derivation and sign conventions correct."
+        level_line = "Explain with JEE/NEET depth, correct sign conventions, and avoid algebra mistakes."
     else:
-        level_line = "Explain class 11–12 level. Only required formulas."
+        level_line = "Explain at class 11–12 level using only required formulas and clear steps."
 
     if style == "detailed":
-        style_line = "Give step-by-step solution. Clearly show formula then substitution."
+        style_line = (
+            "Give step-by-step solution. Show formula first, then substitute, then final result."
+        )
     else:
-        style_line = "Give short exam-ready solution. Final formula + final answer only."
+        style_line = (
+            "Give short exam-ready solution: key formula + substitution + final answer only."
+        )
 
     if language == "hinglish":
         lang_line = "Use Hinglish (Roman Hindi + English). Equations strictly in LaTeX."
@@ -181,15 +183,10 @@ def build_system_prompt(level: str, style: str, language: str) -> str:
         lang_line = "Use clear English. Equations strictly in LaTeX."
 
     return (
-        "You are QueryX, a JEE/NEET problem solver.\n"
-        "OUTPUT RULES:\n"
-        "- Return clean markdown ONLY (no JSON, no code fences).\n"
-        "- Use LaTeX for all equations.\n"
-        "- Be careful with arithmetic sign (+/-) and units.\n\n"
-        f"{level_line}\n{style_line}\n{lang_line}\n\n"
-        "IMPORTANT:\n"
-        "- Choose correct formula and keep it consistent.\n"
-        "- Final numeric answer must be arithmetically correct.\n"
+        "You are QueryX, a JEE/NEET PCMB solver.\n"
+        "Output must be clean markdown only.\n"
+        "Use LaTeX for math. Be careful with signs.\n\n"
+        f"{level_line}\n{style_line}\n{lang_line}\n"
     )
 
 
@@ -198,88 +195,100 @@ def make_prompt(system_prompt: str, question: str) -> str:
         system_prompt
         + "\n\nQuestion:\n"
         + question
-        + "\n\nSolve now:\n"
+        + "\n\nInstructions:\n"
+        + "- Derive formula clearly.\n"
+        + "- Do arithmetic carefully.\n"
+        + "- Final answer clearly.\n"
     )
+
+
+def extract_candidate_expression(text: str) -> Optional[str]:
+    """
+    Try to extract a numeric expression from Gemini output for python check.
+    We look for last occurrence of something that looks like math expression.
+    """
+    if not text:
+        return None
+
+    # Common: "... = 16" or "... = (2*3)+4"
+    # Grab last " = something" chunk
+    eq_matches = re.findall(r"=\s*([0-9\.\s\+\-\*\/\^\(\)eEpi]+)", text)
+    if eq_matches:
+        expr = eq_matches[-1].strip().replace("^", "**")
+        return expr
+
+    # fallback: find last token-like expression
+    tokens = re.findall(r"([0-9\.\s\+\-\*\/\^\(\)eEpi]{3,})", text)
+    if not tokens:
+        return None
+    expr = tokens[-1].strip().replace("^", "**")
+    return expr
 
 
 def reconsider_prompt(original_answer: str, python_value: float) -> str:
     return (
-        "Your derivation/formula selection is OK.\n"
-        "But final arithmetic/sign seems off.\n\n"
-        f"Python recalculated numeric value: {python_value}\n\n"
-        "Task:\n"
-        "- DO NOT change the chosen formula/approach.\n"
-        "- ONLY fix arithmetic/sign and final numeric answer.\n"
-        "- Provide corrected final steps + final answer.\n\n"
+        "Your formula/derivation is fixed. Do NOT change formula.\n"
+        "Only re-check arithmetic/sign substitution.\n\n"
+        f"Python computed value: {python_value}\n\n"
+        "Now rewrite only the calculation lines and final answer (markdown + LaTeX).\n\n"
         "Original answer:\n"
         + original_answer
     )
 
 
-# ---------------------------------------------------------
-# GEMINI CALL WITH TIMEOUT (IMPORTANT FIX)
-# ---------------------------------------------------------
-
-async def gemini_generate(prompt_or_contents: Union[str, list], timeout_sec: int) -> str:
+def gemini_generate_text(prompt: Any) -> str:
     """
-    google-generativeai is sync and can hang sometimes.
-    So we run it in a thread + enforce timeout.
+    Wrapper to call Gemini and return text; raises exception upward with full traceback.
     """
-    def _run():
-        res = model.generate_content(prompt_or_contents)
-        return (res.text or "").strip()
-
-    try:
-        return await asyncio.wait_for(asyncio.to_thread(_run), timeout=timeout_sec)
-    except asyncio.TimeoutError:
-        return "⚠️ Gemini timeout. Please try again (server was slow)."
-    except Exception as e:
-        print("Gemini error:", repr(e))
-        return "⚠️ Gemini error occurred. Please try again."
+    res = model.generate_content(prompt)
+    return (getattr(res, "text", "") or "").strip()
 
 
 # ---------------------------------------------------------
 # ROUTES
 # ---------------------------------------------------------
 
-@app.get("/")
-async def root():
-    return {"message": "QueryX backend is running. Visit /docs for Swagger UI."}
-
-
 @app.get("/health")
 async def health():
-    return {"status": "ok", "model": MODEL_NAME}
+    return {"status": "ok", "model": GEMINI_MODEL}
 
 
 @app.post("/ask-text", response_model=AnswerResponse)
 async def ask_text(payload: AskTextRequest):
     q = (payload.question or "").strip()
     if not q:
-        return AnswerResponse(answer_text="⚠️ Question empty. Please type a question.")
+        return AnswerResponse(answer_text="Please provide a question.")
+
+    # If question is pure math expression, bypass Gemini
+    if looks_like_plain_math_question(q):
+        expr = q.replace("^", "**")
+        val = safe_eval(expr)
+        if val is None:
+            return AnswerResponse(answer_text="Invalid expression.")
+        return AnswerResponse(answer_text=f"Final Answer: $ {val:g} $")
 
     system_prompt = build_system_prompt(payload.level, payload.style, payload.language)
     prompt = make_prompt(system_prompt, q)
 
-    # 1) first answer
-    text = await gemini_generate(prompt, GEMINI_TIMEOUT_SEC)
+    try:
+        first_text = gemini_generate_text(prompt)
 
-    # If Gemini timed out / error message, return it directly
-    if text.startswith("⚠️"):
-        return AnswerResponse(answer_text=text)
+        # python check attempt
+        expr = extract_candidate_expression(first_text)
+        py_val = safe_eval(expr) if expr else None
 
-    # 2) python verify if possible
-    expr = extract_candidate_expression(text)
-    py_val = safe_eval(expr) if expr else None
+        if py_val is not None:
+            second_prompt = reconsider_prompt(first_text, py_val)
+            second_text = gemini_generate_text(second_prompt)
+            if second_text:
+                return AnswerResponse(answer_text=second_text)
 
-    # If we got a valid python value, ask Gemini to re-check calc/sign once
-    if py_val is not None:
-        reconsider = reconsider_prompt(text, py_val)
-        text2 = await gemini_generate(reconsider, RECONSIDER_TIMEOUT_SEC)
-        if text2 and not text2.startswith("⚠️"):
-            text = text2
+        return AnswerResponse(answer_text=first_text or "Empty response from Gemini.")
 
-    return AnswerResponse(answer_text=text)
+    except Exception as e:
+        print("❌ Gemini error in /ask-text:", repr(e))
+        traceback.print_exc()
+        return AnswerResponse(answer_text="⚠️ Gemini error occurred. Please try again.")
 
 
 @app.post("/ask-image", response_model=AnswerResponse)
@@ -289,35 +298,35 @@ async def ask_image(
     style: Style = "detailed",
     language: Language = "hinglish",
 ):
-    system_prompt = build_system_prompt(level, style, language)
-
     try:
+        system_prompt = build_system_prompt(level, style, language)
+
         img_bytes = await file.read()
         if not img_bytes:
-            return AnswerResponse(answer_text="⚠️ Empty image file. Please upload again.")
+            return AnswerResponse(answer_text="Empty image uploaded.")
 
         contents = [
             system_prompt
-            + "\nFirst rewrite the question clearly from the image. Then solve carefully.\n",
+            + "\nTask:\n"
+            + "1) Rewrite the question clearly from the image.\n"
+            + "2) Solve it carefully with correct sign and arithmetic.\n",
             {"mime_type": file.content_type or "image/jpeg", "data": img_bytes},
         ]
 
-        text = await gemini_generate(contents, GEMINI_TIMEOUT_SEC)
+        first_text = gemini_generate_text(contents)
 
-        if text.startswith("⚠️"):
-            return AnswerResponse(answer_text=text)
-
-        expr = extract_candidate_expression(text)
+        expr = extract_candidate_expression(first_text)
         py_val = safe_eval(expr) if expr else None
 
         if py_val is not None:
-            reconsider = reconsider_prompt(text, py_val)
-            text2 = await gemini_generate(reconsider, RECONSIDER_TIMEOUT_SEC)
-            if text2 and not text2.startswith("⚠️"):
-                text = text2
+            second_prompt = reconsider_prompt(first_text, py_val)
+            second_text = gemini_generate_text(second_prompt)
+            if second_text:
+                return AnswerResponse(answer_text=second_text)
 
-        return AnswerResponse(answer_text=text)
+        return AnswerResponse(answer_text=first_text or "Empty response from Gemini.")
 
     except Exception as e:
-        print("Error /ask-image:", repr(e))
-        return AnswerResponse(answer_text="⚠️ Image processing error. Please try again.")
+        print("❌ Gemini error in /ask-image:", repr(e))
+        traceback.print_exc()
+        return AnswerResponse(answer_text="⚠️ Gemini error occurred. Please try again.")
