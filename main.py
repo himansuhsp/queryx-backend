@@ -3,7 +3,8 @@ import re
 import ast
 import math
 import traceback
-from typing import Literal, Optional, Any, Dict
+from typing import Literal, Optional, Any
+from functools import lru_cache
 
 from fastapi import FastAPI, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,24 +16,26 @@ import google.generativeai as genai
 # ---------------------------------------------------------
 # LOAD ENV + CONFIG
 # ---------------------------------------------------------
-
 load_dotenv()
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-if not GEMINI_API_KEY:
-    raise RuntimeError("GEMINI_API_KEY not set in environment")
+# accept both env keys (many people set GOOGLE_API_KEY in Render)
+GEMINI_API_KEY = (
+    os.getenv("GEMINI_API_KEY", "").strip()
+    or os.getenv("GOOGLE_API_KEY", "").strip()
+)
 
+# model preference (but we will fallback automatically)
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash").strip()
+
+if not GEMINI_API_KEY:
+    raise RuntimeError("GEMINI_API_KEY / GOOGLE_API_KEY not set in environment")
+
 genai.configure(api_key=GEMINI_API_KEY)
 
-# Create model
-model = genai.GenerativeModel(GEMINI_MODEL)
-
-app = FastAPI(title="QueryX Backend", version="1.0.0")
+app = FastAPI(title="QueryX Backend", version="1.0.1")
 
 # ---------------------------------------------------------
 # MIDDLEWARE: normalize double slashes in path
-# (frontend BACKEND_URL endswith '/' => //ask-text, //ask-image)
 # ---------------------------------------------------------
 @app.middleware("http")
 async def normalize_path_middleware(request: Request, call_next):
@@ -45,10 +48,9 @@ async def normalize_path_middleware(request: Request, call_next):
 # ---------------------------------------------------------
 # CORS
 # ---------------------------------------------------------
-# In prod you can restrict. For beta keep open.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # beta open
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -57,18 +59,15 @@ app.add_middleware(
 # ---------------------------------------------------------
 # TYPES
 # ---------------------------------------------------------
-
 Level = Literal["basic", "advanced"]
 Style = Literal["detailed", "short"]
 Language = Literal["english", "hinglish"]
-
 
 class AskTextRequest(BaseModel):
     question: str
     level: Level = "basic"
     style: Style = "detailed"
     language: Language = "hinglish"
-
 
 class AnswerResponse(BaseModel):
     answer_text: str
@@ -77,7 +76,6 @@ class AnswerResponse(BaseModel):
 # ---------------------------------------------------------
 # SAFE MATH EVAL (NO SANDBOX EXEC, ONLY MATH EXPRESSIONS)
 # ---------------------------------------------------------
-
 ALLOWED_NAMES = {
     "pi": math.pi,
     "e": math.e,
@@ -111,16 +109,10 @@ ALLOWED_NODES = (
 )
 
 def safe_eval(expr: str) -> Optional[float]:
-    """
-    Evaluate ONLY math expressions safely.
-    Returns float or None.
-    """
     if not expr:
         return None
-
     expr = expr.strip()
 
-    # quick reject suspicious
     if any(x in expr for x in ["__", "import", "exec", "eval", "open", "os.", "sys.", ";", "{", "}", "[", "]"]):
         return None
 
@@ -135,7 +127,6 @@ def safe_eval(expr: str) -> Optional[float]:
                 return None
 
             if isinstance(node, ast.Call):
-                # only allow calling allowed names like sqrt(...)
                 if not isinstance(node.func, ast.Name):
                     return None
                 if node.func.id not in ALLOWED_NAMES:
@@ -148,20 +139,14 @@ def safe_eval(expr: str) -> Optional[float]:
     except Exception:
         return None
 
-
 def looks_like_plain_math_question(q: str) -> bool:
-    """
-    If question is basically math expression like: 2+3, (2*3)+4, 1/2 + 3/4
-    """
     q = q.strip()
-    # allow digits operators spaces parentheses decimal pi e
     return bool(re.fullmatch(r"[0-9\.\s\+\-\*\/\^\(\)eEpi]+", q))
 
 
 # ---------------------------------------------------------
 # GEMINI HELPERS
 # ---------------------------------------------------------
-
 def build_system_prompt(level: str, style: str, language: str) -> str:
     if level == "advanced":
         level_line = "Explain with JEE/NEET depth, correct sign conventions, and avoid algebra mistakes."
@@ -169,13 +154,9 @@ def build_system_prompt(level: str, style: str, language: str) -> str:
         level_line = "Explain at class 11–12 level using only required formulas and clear steps."
 
     if style == "detailed":
-        style_line = (
-            "Give step-by-step solution. Show formula first, then substitute, then final result."
-        )
+        style_line = "Give step-by-step solution. Show formula first, then substitute, then final result."
     else:
-        style_line = (
-            "Give short exam-ready solution: key formula + substitution + final answer only."
-        )
+        style_line = "Give short exam-ready solution: key formula + substitution + final answer only."
 
     if language == "hinglish":
         lang_line = "Use Hinglish (Roman Hindi + English). Equations strictly in LaTeX."
@@ -189,7 +170,6 @@ def build_system_prompt(level: str, style: str, language: str) -> str:
         f"{level_line}\n{style_line}\n{lang_line}\n"
     )
 
-
 def make_prompt(system_prompt: str, question: str) -> str:
     return (
         system_prompt
@@ -201,29 +181,18 @@ def make_prompt(system_prompt: str, question: str) -> str:
         + "- Final answer clearly.\n"
     )
 
-
 def extract_candidate_expression(text: str) -> Optional[str]:
-    """
-    Try to extract a numeric expression from Gemini output for python check.
-    We look for last occurrence of something that looks like math expression.
-    """
     if not text:
         return None
-
-    # Common: "... = 16" or "... = (2*3)+4"
-    # Grab last " = something" chunk
     eq_matches = re.findall(r"=\s*([0-9\.\s\+\-\*\/\^\(\)eEpi]+)", text)
     if eq_matches:
         expr = eq_matches[-1].strip().replace("^", "**")
         return expr
-
-    # fallback: find last token-like expression
     tokens = re.findall(r"([0-9\.\s\+\-\*\/\^\(\)eEpi]{3,})", text)
     if not tokens:
         return None
     expr = tokens[-1].strip().replace("^", "**")
     return expr
-
 
 def reconsider_prompt(original_answer: str, python_value: float) -> str:
     return (
@@ -235,23 +204,51 @@ def reconsider_prompt(original_answer: str, python_value: float) -> str:
         + original_answer
     )
 
+@lru_cache(maxsize=8)
+def _get_model(model_name: str):
+    return genai.GenerativeModel(model_name)
 
 def gemini_generate_text(prompt: Any) -> str:
     """
-    Wrapper to call Gemini and return text; raises exception upward with full traceback.
+    Robust Gemini wrapper with model fallback.
+    Many keys don't support gemini-2.0-flash; fallback prevents beta downtime.
     """
-    res = model.generate_content(prompt)
-    return (getattr(res, "text", "") or "").strip()
+    model_candidates = [
+        GEMINI_MODEL,
+        "gemini-1.5-flash",
+        "gemini-1.5-pro",
+    ]
+
+    last_err: Exception | None = None
+
+    for mname in model_candidates:
+        try:
+            m = _get_model(mname)
+            res = m.generate_content(prompt)
+            text = (getattr(res, "text", "") or "").strip()
+            if text:
+                return text
+            # if empty text, treat as error to try fallback
+            last_err = RuntimeError(f"Empty text from model: {mname}")
+        except Exception as e:
+            last_err = e
+            print(f"❌ Gemini call failed on model={mname}: {repr(e)}", flush=True)
+            traceback.print_exc()
+
+    # after all fallbacks failed
+    raise RuntimeError(f"All Gemini models failed. Last error: {repr(last_err)}")
 
 
 # ---------------------------------------------------------
 # ROUTES
 # ---------------------------------------------------------
+@app.get("/")
+async def root():
+    return {"status": "ok", "service": "QueryX Backend", "model": GEMINI_MODEL}
 
 @app.get("/health")
 async def health():
     return {"status": "ok", "model": GEMINI_MODEL}
-
 
 @app.post("/ask-text", response_model=AnswerResponse)
 async def ask_text(payload: AskTextRequest):
@@ -259,7 +256,7 @@ async def ask_text(payload: AskTextRequest):
     if not q:
         return AnswerResponse(answer_text="Please provide a question.")
 
-    # If question is pure math expression, bypass Gemini
+    # pure math bypass
     if looks_like_plain_math_question(q):
         expr = q.replace("^", "**")
         val = safe_eval(expr)
@@ -273,7 +270,6 @@ async def ask_text(payload: AskTextRequest):
     try:
         first_text = gemini_generate_text(prompt)
 
-        # python check attempt
         expr = extract_candidate_expression(first_text)
         py_val = safe_eval(expr) if expr else None
 
@@ -286,10 +282,9 @@ async def ask_text(payload: AskTextRequest):
         return AnswerResponse(answer_text=first_text or "Empty response from Gemini.")
 
     except Exception as e:
-        print("❌ Gemini error in /ask-text:", repr(e))
+        print("❌ Gemini error in /ask-text:", repr(e), flush=True)
         traceback.print_exc()
         return AnswerResponse(answer_text="⚠️ Gemini error occurred. Please try again.")
-
 
 @app.post("/ask-image", response_model=AnswerResponse)
 async def ask_image(
@@ -327,6 +322,6 @@ async def ask_image(
         return AnswerResponse(answer_text=first_text or "Empty response from Gemini.")
 
     except Exception as e:
-        print("❌ Gemini error in /ask-image:", repr(e))
+        print("❌ Gemini error in /ask-image:", repr(e), flush=True)
         traceback.print_exc()
         return AnswerResponse(answer_text="⚠️ Gemini error occurred. Please try again.")
