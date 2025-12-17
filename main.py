@@ -14,40 +14,42 @@ from dotenv import load_dotenv
 import google.generativeai as genai
 
 # ---------------------------------------------------------
-# LOAD ENV + CONFIG
+# LOAD ENV
 # ---------------------------------------------------------
 load_dotenv()
 
-def pick_api_key() -> str:
-    """
-    Render/railway/vercel env me keys kabhi alag naam se hoti hain.
-    We accept multiple names safely.
-    """
-    candidates = [
-        os.getenv("GEMINI_API_KEY", ""),
-        os.getenv("GOOGLE_API_KEY", ""),
-        os.getenv("GOOGLE_API_KEY", ""),  # (same but kept for clarity)
-        os.getenv("GENAI_API_KEY", ""),
-    ]
-    for k in candidates:
-        k = (k or "").strip()
-        if k:
-            return k
-    return ""
+# Prefer GOOGLE_API_KEY (official). Fallback to GEMINI_API_KEY (old name) if present.
+GOOGLE_API_KEY = (os.getenv("GOOGLE_API_KEY", "") or "").strip()
+GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY", "") or "").strip()
 
-API_KEY = pick_api_key()
-if not API_KEY:
-    raise RuntimeError("No API key found. Set GEMINI_API_KEY (recommended) or GOOGLE_API_KEY in environment.")
+API_KEY = GOOGLE_API_KEY or GEMINI_API_KEY
+GEMINI_MODEL = (os.getenv("GEMINI_MODEL", "gemini-2.0-flash") or "").strip()
 
-GEMINI_MODEL = (os.getenv("GEMINI_MODEL", "gemini-2.0-flash") or "").strip() or "gemini-2.0-flash"
+# Make sure SDK sees GOOGLE_API_KEY
+if API_KEY:
+    os.environ["GOOGLE_API_KEY"] = API_KEY
 
-genai.configure(api_key=API_KEY)
-model = genai.GenerativeModel(GEMINI_MODEL)
+# Configure Gemini SDK (safe even if key missing; we'll handle in request)
+try:
+    if API_KEY:
+        genai.configure(api_key=API_KEY)
+except Exception:
+    # We'll surface error during request
+    pass
 
-app = FastAPI(title="QueryX Backend", version="1.2.0")
+# Lazy model init (so import doesn't crash)
+_model = None
+
+def get_model():
+    global _model
+    if _model is None:
+        _model = genai.GenerativeModel(GEMINI_MODEL)
+    return _model
+
+app = FastAPI(title="QueryX Backend", version="1.0.0")
 
 # ---------------------------------------------------------
-# MIDDLEWARE: normalize // paths
+# MIDDLEWARE: normalize double slashes in path
 # ---------------------------------------------------------
 @app.middleware("http")
 async def normalize_path_middleware(request: Request, call_next):
@@ -85,7 +87,7 @@ class AnswerResponse(BaseModel):
     answer_text: str
 
 # ---------------------------------------------------------
-# SAFE MATH EVAL (ONLY math expressions)
+# SAFE MATH EVAL (ONLY MATH EXPRESSIONS)
 # ---------------------------------------------------------
 ALLOWED_NAMES = {
     "pi": math.pi,
@@ -122,9 +124,9 @@ ALLOWED_NODES = (
 def safe_eval(expr: str) -> Optional[float]:
     if not expr:
         return None
+
     expr = expr.strip()
 
-    # quick reject
     if any(x in expr for x in ["__", "import", "exec", "eval", "open", "os.", "sys.", ";", "{", "}", "[", "]"]):
         return None
 
@@ -133,8 +135,10 @@ def safe_eval(expr: str) -> Optional[float]:
         for node in ast.walk(tree):
             if not isinstance(node, ALLOWED_NODES):
                 return None
+
             if isinstance(node, ast.Name) and node.id not in ALLOWED_NAMES:
                 return None
+
             if isinstance(node, ast.Call):
                 if not isinstance(node.func, ast.Name):
                     return None
@@ -152,23 +156,8 @@ def looks_like_plain_math_question(q: str) -> bool:
     q = q.strip()
     return bool(re.fullmatch(r"[0-9\.\s\+\-\*\/\^\(\)eEpi]+", q))
 
-def is_theory_question(q: str) -> bool:
-    """
-    Theory / explanation type questions me python verification bilkul nahi chahiye.
-    """
-    ql = q.strip().lower()
-    theory_keywords = [
-        "explain", "define", "what is", "derive", "state", "law", "principle",
-        "gauss", "nlm", "newton", "concept", "difference", "why", "how", "write note",
-    ]
-    # if no digits at all, it's almost surely theory
-    has_digit = any(ch.isdigit() for ch in ql)
-    if not has_digit:
-        return True
-    return any(k in ql for k in theory_keywords)
-
 # ---------------------------------------------------------
-# GEMINI HELPERS
+# PROMPTS
 # ---------------------------------------------------------
 def build_system_prompt(level: str, style: str, language: str) -> str:
     if level == "advanced":
@@ -189,9 +178,7 @@ def build_system_prompt(level: str, style: str, language: str) -> str:
     return (
         "You are QueryX, a JEE/NEET PCMB solver.\n"
         "Output must be clean markdown only.\n"
-        "Use LaTeX for math.\n"
-        "If question is conceptual, answer conceptually.\n"
-        "If numerical, show steps and final answer.\n\n"
+        "Use LaTeX for math. Be careful with signs.\n\n"
         f"{level_line}\n{style_line}\n{lang_line}\n"
     )
 
@@ -201,59 +188,53 @@ def make_prompt(system_prompt: str, question: str) -> str:
         + "\n\nQuestion:\n"
         + question
         + "\n\nInstructions:\n"
-        + "- Be accurate.\n"
-        + "- If numerical: show steps and final.\n"
-        + "- If conceptual: explain clearly with examples if needed.\n"
+        + "- Derive formula clearly.\n"
+        + "- Do arithmetic carefully.\n"
+        + "- Final answer clearly.\n"
     )
 
-def extract_final_answer_expression(text: str) -> Optional[str]:
-    """
-    IMPORTANT: Only try extracting expression if model explicitly gives a final answer line.
-    This prevents theory answers from triggering python-check.
-    """
+def extract_candidate_expression(text: str) -> Optional[str]:
     if not text:
         return None
 
-    # Prefer "Final Answer" style
-    m = re.search(r"(Final\s*Answer|Answer)\s*[:\-]\s*\$?\s*([0-9\.\s\+\-\*\/\^\(\)eEpi]+)\s*\$?", text, re.IGNORECASE)
-    if m:
-        expr = (m.group(2) or "").strip().replace("^", "**")
+    eq_matches = re.findall(r"=\s*([0-9\.\s\+\-\*\/\^\(\)eEpi]+)", text)
+    if eq_matches:
+        expr = eq_matches[-1].strip().replace("^", "**")
         return expr
 
-    # Or last "= number/expression" ONLY if it looks like final line
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-    if lines:
-        tail = "\n".join(lines[-3:])
-        eq_matches = re.findall(r"=\s*([0-9\.\s\+\-\*\/\^\(\)eEpi]+)", tail)
-        if eq_matches:
-            expr = eq_matches[-1].strip().replace("^", "**")
-            return expr
-
-    return None
+    tokens = re.findall(r"([0-9\.\s\+\-\*\/\^\(\)eEpi]{3,})", text)
+    if not tokens:
+        return None
+    expr = tokens[-1].strip().replace("^", "**")
+    return expr
 
 def reconsider_prompt(original_answer: str, python_value: float) -> str:
     return (
-        "Keep the same method/formula.\n"
-        "ONLY re-check arithmetic/substitution.\n\n"
+        "Your formula/derivation is fixed. Do NOT change formula.\n"
+        "Only re-check arithmetic/sign substitution.\n\n"
         f"Python computed value: {python_value}\n\n"
-        "Rewrite only calculation + final answer (markdown + LaTeX).\n\n"
+        "Now rewrite only the calculation lines and final answer (markdown + LaTeX).\n\n"
         "Original answer:\n"
         + original_answer
     )
 
-def gemini_generate_text(prompt: Any, retries: int = 2) -> str:
-    """
-    Gemini call with small retries (helps with transient failures / cold starts).
-    """
+# ---------------------------------------------------------
+# GEMINI CALL (with retries)
+# ---------------------------------------------------------
+def gemini_generate_text(prompt: Any) -> str:
+    # If no key, throw a clean error
+    if not (os.getenv("GOOGLE_API_KEY") or ""):
+        raise RuntimeError("GOOGLE_API_KEY missing at runtime")
+
     last_err = None
-    for attempt in range(retries + 1):
+    for _ in range(3):
         try:
-            res = model.generate_content(prompt)
+            res = get_model().generate_content(prompt)
             return (getattr(res, "text", "") or "").strip()
         except Exception as e:
             last_err = e
-            # backoff
-            time.sleep(0.8 * (attempt + 1))
+            time.sleep(0.6)
+
     raise RuntimeError(f"Gemini failed after retries. Last error: {repr(last_err)}")
 
 # ---------------------------------------------------------
@@ -261,17 +242,19 @@ def gemini_generate_text(prompt: Any, retries: int = 2) -> str:
 # ---------------------------------------------------------
 @app.get("/health")
 async def health():
-    return {"status": "ok", "model": GEMINI_MODEL}
+    return {
+        "status": "ok",
+        "model": GEMINI_MODEL,
+        "has_google_api_key": bool((os.getenv("GOOGLE_API_KEY") or "").strip()),
+    }
 
 @app.get("/debug")
 async def debug():
-    # never expose full key
-    key = API_KEY or ""
+    k = (os.getenv("GOOGLE_API_KEY") or "").strip()
     return {
-        "has_key": bool(key),
-        "key_last4": key[-4:] if len(key) >= 4 else "",
+        "has_google_api_key": bool(k),
+        "google_api_key_last4": k[-4:] if k else "",
         "model": GEMINI_MODEL,
-        "python": os.getenv("PYTHON_VERSION", ""),  # may be empty on some platforms
     }
 
 @app.post("/ask-text", response_model=AnswerResponse)
@@ -280,7 +263,7 @@ async def ask_text(payload: AskTextRequest):
     if not q:
         return AnswerResponse(answer_text="Please provide a question.")
 
-    # Pure math => bypass gemini
+    # Pure math → bypass Gemini
     if looks_like_plain_math_question(q):
         expr = q.replace("^", "**")
         val = safe_eval(expr)
@@ -294,23 +277,25 @@ async def ask_text(payload: AskTextRequest):
     try:
         first_text = gemini_generate_text(prompt)
 
-        # ✅ Only do python verification for NON-theory questions
-        if not is_theory_question(q):
-            expr = extract_final_answer_expression(first_text)
-            py_val = safe_eval(expr) if expr else None
+        # optional python check
+        expr = extract_candidate_expression(first_text)
+        py_val = safe_eval(expr) if expr else None
 
-            # only reconsider if we got a meaningful python value
-            if py_val is not None:
-                second_prompt = reconsider_prompt(first_text, py_val)
-                second_text = gemini_generate_text(second_prompt, retries=1)
-                if second_text:
-                    return AnswerResponse(answer_text=second_text)
+        if py_val is not None:
+            second_prompt = reconsider_prompt(first_text, py_val)
+            second_text = gemini_generate_text(second_prompt)
+            if second_text:
+                return AnswerResponse(answer_text=second_text)
 
         return AnswerResponse(answer_text=first_text or "Empty response from Gemini.")
 
     except Exception as e:
         print("❌ Gemini error in /ask-text:", repr(e))
         traceback.print_exc()
+        # surface exact key-missing style error to help debugging
+        msg = str(e)
+        if "GOOGLE_API_KEY" in msg or "API Key not found" in msg:
+            return AnswerResponse(answer_text="⚠️ Gemini API key issue on server. Check GOOGLE_API_KEY in Render/Railway env.")
         return AnswerResponse(answer_text="⚠️ Gemini error occurred. Please try again.")
 
 @app.post("/ask-image", response_model=AnswerResponse)
@@ -322,6 +307,7 @@ async def ask_image(
 ):
     try:
         system_prompt = build_system_prompt(level, style, language)
+
         img_bytes = await file.read()
         if not img_bytes:
             return AnswerResponse(answer_text="Empty image uploaded.")
@@ -330,19 +316,18 @@ async def ask_image(
             system_prompt
             + "\nTask:\n"
             + "1) Rewrite the question clearly from the image.\n"
-            + "2) Solve it carefully.\n"
-            + "If conceptual, explain concept.\n",
+            + "2) Solve it carefully with correct sign and arithmetic.\n",
             {"mime_type": file.content_type or "image/jpeg", "data": img_bytes},
         ]
 
         first_text = gemini_generate_text(contents)
 
-        # For image: python-check ONLY if output contains explicit "Final Answer"
-        expr = extract_final_answer_expression(first_text)
+        expr = extract_candidate_expression(first_text)
         py_val = safe_eval(expr) if expr else None
+
         if py_val is not None:
             second_prompt = reconsider_prompt(first_text, py_val)
-            second_text = gemini_generate_text(second_prompt, retries=1)
+            second_text = gemini_generate_text(second_prompt)
             if second_text:
                 return AnswerResponse(answer_text=second_text)
 
@@ -351,4 +336,7 @@ async def ask_image(
     except Exception as e:
         print("❌ Gemini error in /ask-image:", repr(e))
         traceback.print_exc()
+        msg = str(e)
+        if "GOOGLE_API_KEY" in msg or "API Key not found" in msg:
+            return AnswerResponse(answer_text="⚠️ Gemini API key issue on server. Check GOOGLE_API_KEY in Render/Railway env.")
         return AnswerResponse(answer_text="⚠️ Gemini error occurred. Please try again.")
