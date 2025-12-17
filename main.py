@@ -17,24 +17,17 @@ import google.generativeai as genai
 # ---------------------------------------------------------
 load_dotenv()
 
-def _clean_key(x: str) -> str:
-    if not x:
-        return ""
-    # remove quotes + whitespace/newlines
-    return x.strip().strip('"').strip("'").strip()
-
-# Accept BOTH names (local vs cloud mismatch fix)
-GOOGLE_API_KEY = _clean_key(os.getenv("GOOGLE_API_KEY", ""))
-GEMINI_API_KEY = _clean_key(os.getenv("GEMINI_API_KEY", ""))
-
+# Accept BOTH env names (Render/Railway confusion proof)
+GOOGLE_API_KEY = (os.getenv("GOOGLE_API_KEY") or "").strip()
+GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or "").strip()
 API_KEY = GOOGLE_API_KEY or GEMINI_API_KEY
 
-GEMINI_MODEL = _clean_key(os.getenv("GEMINI_MODEL", "gemini-2.0-flash")) or "gemini-2.0-flash"
+GEMINI_MODEL = (os.getenv("GEMINI_MODEL") or "gemini-2.0-flash").strip()
 
 app = FastAPI(title="QueryX Backend", version="1.0.0")
 
 # ---------------------------------------------------------
-# MIDDLEWARE: normalize double slashes
+# MIDDLEWARE: normalize double slashes in path
 # ---------------------------------------------------------
 @app.middleware("http")
 async def normalize_path_middleware(request: Request, call_next):
@@ -45,7 +38,7 @@ async def normalize_path_middleware(request: Request, call_next):
     return await call_next(request)
 
 # ---------------------------------------------------------
-# CORS
+# CORS (beta open)
 # ---------------------------------------------------------
 app.add_middleware(
     CORSMiddleware,
@@ -142,8 +135,22 @@ def looks_like_plain_math_question(q: str) -> bool:
     return bool(re.fullmatch(r"[0-9\.\s\+\-\*\/\^\(\)eEpi]+", q))
 
 # ---------------------------------------------------------
-# GEMINI HELPERS
+# GEMINI (LAZY INIT)
 # ---------------------------------------------------------
+_model = None
+
+def get_model():
+    global _model
+    if _model is not None:
+        return _model
+
+    if not API_KEY:
+        raise RuntimeError("API key missing. Set GOOGLE_API_KEY or GEMINI_API_KEY.")
+
+    genai.configure(api_key=API_KEY)
+    _model = genai.GenerativeModel(GEMINI_MODEL)
+    return _model
+
 def build_system_prompt(level: str, style: str, language: str) -> str:
     level_line = (
         "Explain with JEE/NEET depth, correct sign conventions, and avoid algebra mistakes."
@@ -184,9 +191,11 @@ def make_prompt(system_prompt: str, question: str) -> str:
 def extract_candidate_expression(text: str) -> Optional[str]:
     if not text:
         return None
+
     eq_matches = re.findall(r"=\s*([0-9\.\s\+\-\*\/\^\(\)eEpi]+)", text)
     if eq_matches:
         return eq_matches[-1].strip().replace("^", "**")
+
     tokens = re.findall(r"([0-9\.\s\+\-\*\/\^\(\)eEpi]{3,})", text)
     if not tokens:
         return None
@@ -202,20 +211,6 @@ def reconsider_prompt(original_answer: str, python_value: float) -> str:
         + original_answer
     )
 
-_model = None
-
-def get_model():
-    global _model
-    if _model is not None:
-        return _model
-
-    if not API_KEY:
-        raise RuntimeError("NO_API_KEY: Set GOOGLE_API_KEY or GEMINI_API_KEY in env")
-
-    genai.configure(api_key=API_KEY)
-    _model = genai.GenerativeModel(GEMINI_MODEL)
-    return _model
-
 def gemini_generate_text(prompt: Any) -> str:
     m = get_model()
     res = m.generate_content(prompt)
@@ -226,16 +221,21 @@ def gemini_generate_text(prompt: Any) -> str:
 # ---------------------------------------------------------
 @app.get("/health")
 async def health():
-    return {"status": "ok", "model": GEMINI_MODEL}
+    return {
+        "status": "ok",
+        "model": GEMINI_MODEL,
+        "has_api_key": bool(API_KEY),
+        "api_key_source": "GOOGLE_API_KEY" if GOOGLE_API_KEY else ("GEMINI_API_KEY" if GEMINI_API_KEY else None),
+    }
 
 @app.get("/debug")
 async def debug():
+    last4 = (API_KEY[-4:] if API_KEY else None)
     return {
-        "has_google_api_key": bool(GOOGLE_API_KEY),
-        "has_gemini_api_key": bool(GEMINI_API_KEY),
-        "using": "GOOGLE_API_KEY" if GOOGLE_API_KEY else ("GEMINI_API_KEY" if GEMINI_API_KEY else "NONE"),
-        "api_key_last4": (API_KEY[-4:] if API_KEY else None),
+        "has_api_key": bool(API_KEY),
+        "api_key_last4": last4,
         "model": GEMINI_MODEL,
+        "api_key_source": "GOOGLE_API_KEY" if GOOGLE_API_KEY else ("GEMINI_API_KEY" if GEMINI_API_KEY else None),
     }
 
 @app.post("/ask-text", response_model=AnswerResponse)
@@ -244,6 +244,7 @@ async def ask_text(payload: AskTextRequest):
     if not q:
         return AnswerResponse(answer_text="Please provide a question.")
 
+    # pure math => python
     if looks_like_plain_math_question(q):
         expr = q.replace("^", "**")
         val = safe_eval(expr)
@@ -251,6 +252,7 @@ async def ask_text(payload: AskTextRequest):
             return AnswerResponse(answer_text="Invalid expression.")
         return AnswerResponse(answer_text=f"Final Answer: $ {val:g} $")
 
+    # else => gemini
     system_prompt = build_system_prompt(payload.level, payload.style, payload.language)
     prompt = make_prompt(system_prompt, q)
 
@@ -269,22 +271,15 @@ async def ask_text(payload: AskTextRequest):
         return AnswerResponse(answer_text=first_text or "Empty response from Gemini.")
 
     except Exception as e:
-        msg = str(e)
-
-        # make error message more actionable
-        if "NO_API_KEY" in msg:
-            return AnswerResponse(answer_text="⚠️ Gemini key missing on server. Set GOOGLE_API_KEY or GEMINI_API_KEY in env.")
-        if "API key not valid" in msg or "API_KEY_INVALID" in msg:
-            return AnswerResponse(answer_text="⚠️ Gemini API key invalid. Use Google AI Studio API key.")
-        if "API Key not found" in msg:
-            return AnswerResponse(answer_text="⚠️ Gemini API key not found by Google. Env not applied/redeploy or wrong key source.")
-        if "403" in msg:
-            return AnswerResponse(answer_text="⚠️ Gemini blocked (403). Check API enabled / region / quota.")
-        if "429" in msg:
-            return AnswerResponse(answer_text="⚠️ Gemini rate limit (429). Try again after some time.")
-
         print("❌ Gemini error in /ask-text:", repr(e))
         traceback.print_exc()
+
+        # If API key missing, return clear message
+        if "API key" in str(e) or "key" in str(e).lower():
+            return AnswerResponse(
+                answer_text="⚠️ Gemini API key issue on server. Check GOOGLE_API_KEY / GEMINI_API_KEY in Railway Variables."
+            )
+
         return AnswerResponse(answer_text="⚠️ Gemini error occurred. Please try again.")
 
 @app.post("/ask-image", response_model=AnswerResponse)
@@ -323,11 +318,12 @@ async def ask_image(
         return AnswerResponse(answer_text=first_text or "Empty response from Gemini.")
 
     except Exception as e:
-        msg = str(e)
-        if "NO_API_KEY" in msg:
-            return AnswerResponse(answer_text="⚠️ Gemini key missing on server. Set GOOGLE_API_KEY or GEMINI_API_KEY in env.")
-        if "API Key not found" in msg:
-            return AnswerResponse(answer_text="⚠️ Gemini API key not found by Google. Env not applied/redeploy or wrong key source.")
         print("❌ Gemini error in /ask-image:", repr(e))
         traceback.print_exc()
+
+        if "API key" in str(e) or "key" in str(e).lower():
+            return AnswerResponse(
+                answer_text="⚠️ Gemini API key issue on server. Check GOOGLE_API_KEY / GEMINI_API_KEY in Railway Variables."
+            )
+
         return AnswerResponse(answer_text="⚠️ Gemini error occurred. Please try again.")
