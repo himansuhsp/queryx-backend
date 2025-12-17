@@ -17,25 +17,38 @@ import google.generativeai as genai
 # ---------------------------------------------------------
 load_dotenv()
 
-def _pick_api_key() -> str:
-    # Accept multiple names to avoid Render/env mismatch
-    for k in ["GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_AI_API_KEY"]:
+def _get_api_key() -> str:
+    """
+    Support multiple env var names so Render mis-config doesn't break.
+    Priority: GEMINI_API_KEY -> GOOGLE_API_KEY -> GOOGLE_GENAI_API_KEY
+    """
+    for k in ["GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GENAI_API_KEY"]:
         v = (os.getenv(k, "") or "").strip()
         if v:
-            print(f"✅ Using API key from env: {k} (len={len(v)})")
             return v
-    print("❌ No API key found in env. Expected GEMINI_API_KEY / GOOGLE_API_KEY")
     return ""
 
-GEMINI_API_KEY = _pick_api_key()
+GEMINI_API_KEY = _get_api_key()
 GEMINI_MODEL = (os.getenv("GEMINI_MODEL", "gemini-2.0-flash") or "").strip()
 
-# NOTE: Don't hard-crash in production; return graceful error on endpoints instead
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel(GEMINI_MODEL)
-else:
-    model = None
+# Lazy model (init only when first request needs it)
+_model = None
+
+def get_model():
+    global _model
+    if _model is not None:
+        return _model
+
+    api_key = _get_api_key()
+    if not api_key:
+        raise RuntimeError(
+            "Gemini API key missing. Set GEMINI_API_KEY (or GOOGLE_API_KEY) in environment."
+        )
+
+    genai.configure(api_key=api_key)
+    _model = genai.GenerativeModel(GEMINI_MODEL)
+    return _model
+
 
 app = FastAPI(title="QueryX Backend", version="1.0.0")
 
@@ -55,7 +68,7 @@ async def normalize_path_middleware(request: Request, call_next):
 # ---------------------------------------------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],   # beta open
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -94,22 +107,9 @@ ALLOWED_NAMES = {
 }
 
 ALLOWED_NODES = (
-    ast.Expression,
-    ast.BinOp,
-    ast.UnaryOp,
-    ast.Num,
-    ast.Constant,
-    ast.Name,
-    ast.Load,
-    ast.Add,
-    ast.Sub,
-    ast.Mult,
-    ast.Div,
-    ast.Pow,
-    ast.USub,
-    ast.UAdd,
-    ast.Call,
-    ast.Mod,
+    ast.Expression, ast.BinOp, ast.UnaryOp, ast.Num, ast.Constant,
+    ast.Name, ast.Load, ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Pow,
+    ast.USub, ast.UAdd, ast.Call, ast.Mod
 )
 
 def safe_eval(expr: str) -> Optional[float]:
@@ -118,6 +118,7 @@ def safe_eval(expr: str) -> Optional[float]:
     expr = expr.strip()
     if any(x in expr for x in ["__", "import", "exec", "eval", "open", "os.", "sys.", ";", "{", "}", "[", "]"]):
         return None
+
     try:
         tree = ast.parse(expr, mode="eval")
         for node in ast.walk(tree):
@@ -130,6 +131,7 @@ def safe_eval(expr: str) -> Optional[float]:
                     return None
                 if node.func.id not in ALLOWED_NAMES:
                     return None
+
         val = eval(compile(tree, "<expr>", "eval"), {"__builtins__": {}}, ALLOWED_NAMES)
         if isinstance(val, (int, float)):
             return float(val)
@@ -200,9 +202,8 @@ def reconsider_prompt(original_answer: str, python_value: float) -> str:
     )
 
 def gemini_generate_text(prompt: Any) -> str:
-    if model is None:
-        raise RuntimeError("GEMINI_API_KEY missing on server (model not initialized)")
-    res = model.generate_content(prompt)
+    m = get_model()
+    res = m.generate_content(prompt)
     return (getattr(res, "text", "") or "").strip()
 
 # ---------------------------------------------------------
@@ -210,12 +211,9 @@ def gemini_generate_text(prompt: Any) -> str:
 # ---------------------------------------------------------
 @app.get("/health")
 async def health():
-    return {
-        "status": "ok",
-        "model": GEMINI_MODEL,
-        "api_key_present": bool(GEMINI_API_KEY),
-        "api_key_len": len(GEMINI_API_KEY) if GEMINI_API_KEY else 0,
-    }
+    # don't expose key, only show whether present
+    key_present = bool(_get_api_key())
+    return {"status": "ok", "model": GEMINI_MODEL, "api_key_present": key_present}
 
 @app.post("/ask-text", response_model=AnswerResponse)
 async def ask_text(payload: AskTextRequest):
@@ -235,19 +233,23 @@ async def ask_text(payload: AskTextRequest):
 
     try:
         first_text = gemini_generate_text(prompt)
+
         expr = extract_candidate_expression(first_text)
         py_val = safe_eval(expr) if expr else None
 
         if py_val is not None:
-            second_prompt = reconsider_prompt(first_text, py_val)
-            second_text = gemini_generate_text(second_prompt)
+            second_text = gemini_generate_text(reconsider_prompt(first_text, py_val))
             if second_text:
                 return AnswerResponse(answer_text=second_text)
 
         return AnswerResponse(answer_text=first_text or "Empty response from Gemini.")
+
     except Exception as e:
         print("❌ Gemini error in /ask-text:", repr(e))
         traceback.print_exc()
+        # give a more useful message to UI
+        if "API key" in str(e).lower() or "api_key" in str(e).lower():
+            return AnswerResponse(answer_text="⚠️ Gemini API key missing/invalid on server. Check Render env.")
         return AnswerResponse(answer_text="⚠️ Gemini error occurred. Please try again.")
 
 @app.post("/ask-image", response_model=AnswerResponse)
@@ -273,17 +275,20 @@ async def ask_image(
         ]
 
         first_text = gemini_generate_text(contents)
+
         expr = extract_candidate_expression(first_text)
         py_val = safe_eval(expr) if expr else None
 
         if py_val is not None:
-            second_prompt = reconsider_prompt(first_text, py_val)
-            second_text = gemini_generate_text(second_prompt)
+            second_text = gemini_generate_text(reconsider_prompt(first_text, py_val))
             if second_text:
                 return AnswerResponse(answer_text=second_text)
 
         return AnswerResponse(answer_text=first_text or "Empty response from Gemini.")
+
     except Exception as e:
         print("❌ Gemini error in /ask-image:", repr(e))
         traceback.print_exc()
+        if "API key" in str(e).lower() or "api_key" in str(e).lower():
+            return AnswerResponse(answer_text="⚠️ Gemini API key missing/invalid on server. Check Render env.")
         return AnswerResponse(answer_text="⚠️ Gemini error occurred. Please try again.")
