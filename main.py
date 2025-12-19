@@ -11,6 +11,7 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 
 import google.generativeai as genai
+from google.generativeai.types import HarmCategory, HarmBlockThreshold
 
 # Optional image support (PIL)
 try:
@@ -19,9 +20,8 @@ try:
 except Exception:
     PIL_AVAILABLE = False
 
-
 # -------------------------
-# Load env (local dev only)
+# Load env
 # -------------------------
 load_dotenv()
 
@@ -30,36 +30,42 @@ load_dotenv()
 # -------------------------
 APP_NAME = "QueryX Backend"
 
-# IMPORTANT:
-# Do NOT force GEMINI_MODEL in Railway unless you are 100% sure.
-# Many "Gemini error occurred" cases are due to unstable/blocked model names.
-ENV_MODEL = os.getenv("GEMINI_MODEL", "").strip()
-
-# Stable production fallback order (avoid 2.0 for now)
-MODEL_FALLBACK: List[str] = []
-if ENV_MODEL:
-    MODEL_FALLBACK.append(ENV_MODEL)
-
-MODEL_FALLBACK += [
-    "gemini-1.5-flash",  # most stable + fast
-    "gemini-1.5-pro",    # backup
-]
-
-# API key
+# API key validation
 API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 if not API_KEY:
-    raise RuntimeError(
-        "Gemini API key not found. Set GEMINI_API_KEY (recommended) or GOOGLE_API_KEY in Railway Variables."
-    )
+    raise RuntimeError("GEMINI_API_KEY missing in environment variables.")
 
 genai.configure(api_key=API_KEY)
+
+# Stable models for 2025
+ENV_MODEL = os.getenv("GEMINI_MODEL", "").strip()
+MODEL_FALLBACK = []
+if ENV_MODEL:
+    MODEL_FALLBACK.append(ENV_MODEL)
+MODEL_FALLBACK += ["gemini-1.5-flash", "gemini-1.5-pro"]
+
+# -------------------------
+# Safety & Generation Config
+# -------------------------
+# Ye settings Gemini ko answers block karne se rokengi
+SAFETY_SETTINGS = {
+    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+}
+
+GENERATION_CONFIG = {
+    "temperature": 0.2,
+    "top_p": 0.9,
+    "max_output_tokens": 1500,
+}
 
 # -------------------------
 # FastAPI setup
 # -------------------------
 app = FastAPI(title=APP_NAME)
 
-# CORS: lock to your Vercel + local dev
 ALLOWED_ORIGINS = [
     "https://queryx-frontend.vercel.app",
     "http://localhost:3000",
@@ -75,256 +81,114 @@ app.add_middleware(
 )
 
 # -------------------------
-# Request Models
+# Models & Helpers
 # -------------------------
 class AskTextRequest(BaseModel):
     question: str
-    level: Optional[str] = "basic"        # basic / advanced
-    style: Optional[str] = "detailed"     # detailed / short
-    language: Optional[str] = "hinglish"  # hinglish / english
-
-
-# -------------------------
-# Helpers: arithmetic checker
-# -------------------------
-MATH_EXPR_RE = re.compile(r"^[\s0-9\.\+\-\*\/\%\(\)\^\s]+$")
+    level: Optional[str] = "basic"
+    style: Optional[str] = "detailed"
+    language: Optional[str] = "hinglish"
 
 def _is_pure_arithmetic(q: str) -> bool:
     q = (q or "").strip()
-    return bool(q) and bool(MATH_EXPR_RE.match(q))
+    return bool(q) and bool(re.match(r"^[\s0-9\.\+\-\*\/\%\(\)\^\s]+$", q))
 
 def _safe_eval_arithmetic(expr: str) -> float:
     expr = (expr or "").strip().replace("^", "**")
-
-    blocked = ["__", "import", "os.", "sys.", "eval", "exec", "open(", "subprocess", "socket"]
-    low = expr.lower()
-    for b in blocked:
-        if b in low:
-            raise ValueError("Unsafe expression")
-
     import ast
-
-    allowed_nodes = (
-        ast.Expression,
-        ast.BinOp,
-        ast.UnaryOp,
-        ast.Num,
-        ast.Constant,
-        ast.Add,
-        ast.Sub,
-        ast.Mult,
-        ast.Div,
-        ast.Mod,
-        ast.Pow,
-        ast.USub,
-        ast.UAdd,
-        ast.Load,
-        ast.FloorDiv,
-    )
-
     tree = ast.parse(expr, mode="eval")
-    for node in ast.walk(tree):
-        if not isinstance(node, allowed_nodes):
-            raise ValueError(f"Disallowed token: {type(node).__name__}")
-
     return eval(compile(tree, "<safe_eval>", "eval"), {"__builtins__": {}}, {})
 
-
-# -------------------------
-# Output cleanup: HTML subs/sups -> LaTeX
-# (sometimes model returns <sub>/<sup>; we convert to LaTeX)
-# -------------------------
-SUB_RE = re.compile(r"<sub>(.*?)</sub>", re.IGNORECASE | re.DOTALL)
-SUP_RE = re.compile(r"<sup>(.*?)</sup>", re.IGNORECASE | re.DOTALL)
-
 def _html_to_latex(text: str) -> str:
-    if not text:
-        return text
-    text = SUB_RE.sub(r"_{\1}", text)
-    text = SUP_RE.sub(r"^{\1}", text)
-    # Remove common HTML line breaks if any
+    if not text: return text
+    text = re.sub(r"<sub>(.*?)</sub>", r"_{\1}", text, flags=re.IGNORECASE)
+    text = re.sub(r"<sup>(.*?)</sup>", r"^{\1}", text, flags=re.IGNORECASE)
     text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
     return text
 
-
 def _build_prompt(question: str, level: str, style: str, language: str) -> str:
-    level = (level or "basic").lower()
-    style = (style or "detailed").lower()
-    language = (language or "hinglish").lower()
-
-    # Keep the prompt strict so output looks less "ChatGPT-y"
-    # (more direct, fewer fillers)
     return f"""
-You are QueryX, a JEE/NEET PCMB solver.
+You are QueryX, an expert JEE/NEET PCMB solver.
+User preferences: Level={level}, Style={style}, Language={language}.
 
-User preferences:
-- Level: {level}
-- Style: {style}
-- Language: {language}
+STRICT RULES:
+1. Output MUST be Markdown.
+2. Math MUST be in LaTeX ($...$ or $$...$$). No HTML tags.
+3. Be direct. Start solving immediately.
+4. If arithmetic, return only the number.
 
-OUTPUT FORMAT (STRICT):
-- Output MUST be Markdown.
-- Math MUST be LaTeX only inside $...$ or $$...$$.
-- DO NOT use HTML tags like <sub>, <sup>, <br>, etc.
-- Avoid unnecessary intro lines. Start directly with solution.
-- Use step-by-step. Keep it exam-oriented.
-- If the input is purely arithmetic, return ONLY the final number.
-
-Question:
-{question}
+Question: {question}
 """.strip()
 
-
 def _extract_text(resp: Any) -> str:
-    text = getattr(resp, "text", None)
-    if text and str(text).strip():
-        return str(text).strip()
-
-    if hasattr(resp, "candidates") and resp.candidates:
-        parts: List[str] = []
-        for c in resp.candidates:
-            if getattr(c, "content", None) and getattr(c.content, "parts", None):
-                for p in c.content.parts:
-                    t = getattr(p, "text", None)
-                    if t:
-                        parts.append(str(t))
-        joined = "\n".join(parts).strip()
-        if joined:
-            return joined
-
-    return ""
-
+    # Handle blocked responses
+    if not resp.candidates:
+        return "⚠️ Response blocked by Safety Filters. Try rephrasing."
+    
+    try:
+        return resp.text.strip()
+    except Exception:
+        # Fallback manual extraction
+        try:
+            parts = [p.text for p in resp.candidates[0].content.parts if hasattr(p, 'text')]
+            return "\n".join(parts).strip()
+        except:
+            return ""
 
 def _short_err(e: Exception) -> str:
-    # Small readable error for UI/log
-    msg = str(e).strip()
-    if not msg:
-        msg = type(e).__name__
-    return msg[:220]
+    return str(e)[:200]
 
-
-def _gemini_generate(prompt: str, request_id: str) -> str:
-    generation_config = {
-        "temperature": 0.2,
-        "top_p": 0.9,
-        "max_output_tokens": 1200,
-    }
-
-    # Try multiple attempts per model
-    max_attempts = 3
-    base_sleep = 1.0
-    last_err: Optional[Exception] = None
-
+# -------------------------
+# Core Gemini Logic
+# -------------------------
+def _gemini_generate(prompt: str, request_id: str, image: Optional[Any] = None) -> str:
+    last_err = None
     for model_name in MODEL_FALLBACK:
         model = genai.GenerativeModel(model_name)
-
-        for attempt in range(1, max_attempts + 1):
+        for attempt in range(1, 4):
             try:
-                resp = model.generate_content(prompt, generation_config=generation_config)
+                content = [prompt, image] if image else prompt
+                resp = model.generate_content(
+                    content,
+                    generation_config=GENERATION_CONFIG,
+                    safety_settings=SAFETY_SETTINGS
+                )
                 text = _extract_text(resp)
                 if text:
                     return _html_to_latex(text)
-
-                raise RuntimeError("Empty response from Gemini")
-
+                raise RuntimeError("Empty response")
             except Exception as e:
                 last_err = e
-                print(
-                    f"[{request_id}] model={model_name} attempt {attempt}/{max_attempts} failed: {_short_err(e)}"
-                )
-                if attempt < max_attempts:
-                    time.sleep(base_sleep * (2 ** (attempt - 1)))
-
-        print(f"[{request_id}] switching model fallback after failures: {model_name}")
-
-    raise RuntimeError(f"All models failed. Last error: {_short_err(last_err or RuntimeError('unknown'))}")
-
-
-def _gemini_generate_image(prompt: str, image: "Image.Image", request_id: str) -> str:
-    generation_config = {
-        "temperature": 0.2,
-        "top_p": 0.9,
-        "max_output_tokens": 1200,
-    }
-
-    max_attempts = 3
-    base_sleep = 1.0
-    last_err: Optional[Exception] = None
-
-    for model_name in MODEL_FALLBACK:
-        model = genai.GenerativeModel(model_name)
-
-        for attempt in range(1, max_attempts + 1):
-            try:
-                resp = model.generate_content([prompt, image], generation_config=generation_config)
-                text = _extract_text(resp)
-                if text:
-                    return _html_to_latex(text)
-
-                raise RuntimeError("Empty response from Gemini (image)")
-
-            except Exception as e:
-                last_err = e
-                print(
-                    f"[{request_id}] model={model_name} image attempt {attempt}/{max_attempts} failed: {_short_err(e)}"
-                )
-                if attempt < max_attempts:
-                    time.sleep(base_sleep * (2 ** (attempt - 1)))
-
-        print(f"[{request_id}] switching model fallback after failures (image): {model_name}")
-
-    raise RuntimeError(f"All models failed (image). Last error: {_short_err(last_err or RuntimeError('unknown'))}")
-
+                print(f"[{request_id}] {model_name} attempt {attempt} fail: {_short_err(e)}")
+                time.sleep(1)
+    raise RuntimeError(f"All models failed. Last error: {_short_err(last_err)}")
 
 # -------------------------
 # Routes
 # -------------------------
-@app.get("/")
-def root():
-    return {
-        "ok": True,
-        "service": APP_NAME,
-        "models": MODEL_FALLBACK,
-    }
-
 @app.get("/health")
 def health():
-    return {
-        "ok": True,
-        "models": MODEL_FALLBACK,
-        "pil": PIL_AVAILABLE,
-        "has_key": True if API_KEY else False,
-    }
-
+    return {"ok": True, "has_key": bool(API_KEY), "pil": PIL_AVAILABLE}
 
 @app.post("/ask-text")
 def ask_text(payload: AskTextRequest):
     request_id = str(uuid.uuid4())[:8]
     q = (payload.question or "").strip()
+    if not q: return {"answer_text": "⚠️ Question empty hai."}
 
-    if not q:
-        return {"answer_text": "⚠️ Question empty hai."}
-
-    # Local arithmetic
     if _is_pure_arithmetic(q):
         try:
             val = _safe_eval_arithmetic(q)
-            if abs(val - int(val)) < 1e-12:
-                return {"answer_text": str(int(val))}
-            return {"answer_text": str(val)}
-        except Exception:
-            # fallback to gemini if parsing fails
-            pass
+            return {"answer_text": str(int(val) if abs(val - int(val)) < 1e-12 else val)}
+        except: pass
 
     prompt = _build_prompt(q, payload.level, payload.style, payload.language)
-
     try:
         answer = _gemini_generate(prompt, request_id)
         return {"answer_text": answer}
     except Exception as e:
-        print(f"[{request_id}] ERROR ask-text: {_short_err(e)}")
+        print(f"[{request_id}] ERROR: {str(e)}")
         return {"answer_text": f"⚠️ Gemini error occurred. Request id: {request_id}"}
-
 
 @app.post("/ask-image")
 async def ask_image(
@@ -334,22 +198,19 @@ async def ask_image(
     language: str = "hinglish",
 ):
     request_id = str(uuid.uuid4())[:8]
-
     if not PIL_AVAILABLE:
-        return {"answer_text": "⚠️ Image support disabled. requirements.txt me pillow add karo."}
+        return {"answer_text": "⚠️ Pillow library missing in requirements.txt"}
 
     try:
         content = await file.read()
-        img = Image.open(io.BytesIO(content)).convert("RGB")  # type: ignore
+        img = Image.open(io.BytesIO(content)).convert("RGB")
     except Exception as e:
-        print(f"[{request_id}] ERROR reading image: {_short_err(e)}")
-        return {"answer_text": "⚠️ Image read nahi ho pa raha. Clear photo + jpg/png try karo."}
+        return {"answer_text": f"⚠️ Image error: {str(e)}"}
 
-    prompt = _build_prompt("Solve the question from the image.", level, style, language)
-
+    prompt = _build_prompt("Solve the question from this image.", level, style, language)
     try:
-        answer = _gemini_generate_image(prompt, img, request_id)
+        answer = _gemini_generate(prompt, request_id, image=img)
         return {"answer_text": answer}
     except Exception as e:
-        print(f"[{request_id}] ERROR ask-image: {_short_err(e)}")
+        print(f"[{request_id}] ERROR: {str(e)}")
         return {"answer_text": f"⚠️ Gemini error occurred. Request id: {request_id}"}
