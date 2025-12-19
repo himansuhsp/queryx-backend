@@ -179,7 +179,7 @@ def _gemini_call(prompt: Any, request_id: str) -> str:
     last_err: Optional[Exception] = None
 
     for model_name in MODEL_FALLBACK:
-        model = genai.GenerativeModel("gemini-2.0-flash")
+        model = genai.GenerativeModel(model_name)
 
         for attempt in range(1, max_attempts + 1):
             try:
