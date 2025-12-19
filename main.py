@@ -3,6 +3,7 @@ import re
 import time
 import uuid
 import io
+import traceback
 from typing import Optional, List, Any
 
 from fastapi import FastAPI, UploadFile, File
@@ -33,21 +34,19 @@ APP_NAME = "QueryX Backend"
 # API key validation
 API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 if not API_KEY:
-    raise RuntimeError("GEMINI_API_KEY missing in environment variables.")
+    # Isse backend start hi nahi hoga agar key missing hai
+    print("CRITICAL ERROR: GEMINI_API_KEY is not set in Environment Variables!")
 
 genai.configure(api_key=API_KEY)
 
-# Stable models for 2025
+# Stable models
 ENV_MODEL = os.getenv("GEMINI_MODEL", "").strip()
 MODEL_FALLBACK = []
 if ENV_MODEL:
     MODEL_FALLBACK.append(ENV_MODEL)
 MODEL_FALLBACK += ["gemini-1.5-flash", "gemini-1.5-pro"]
 
-# -------------------------
-# Safety & Generation Config
-# -------------------------
-# Ye settings Gemini ko answers block karne se rokengi
+# Safety Settings (BLOCK_NONE taaki PCMB questions block na ho)
 SAFETY_SETTINGS = {
     HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
     HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
@@ -113,7 +112,7 @@ User preferences: Level={level}, Style={style}, Language={language}.
 
 STRICT RULES:
 1. Output MUST be Markdown.
-2. Math MUST be in LaTeX ($...$ or $$...$$). No HTML tags.
+2. Math MUST be in LaTeX ($...$ or $$...$$).
 3. Be direct. Start solving immediately.
 4. If arithmetic, return only the number.
 
@@ -121,22 +120,16 @@ Question: {question}
 """.strip()
 
 def _extract_text(resp: Any) -> str:
-    # Handle blocked responses
     if not resp.candidates:
-        return "⚠️ Response blocked by Safety Filters. Try rephrasing."
-    
+        return "⚠️ Response blocked by Safety Filters."
     try:
         return resp.text.strip()
     except Exception:
-        # Fallback manual extraction
         try:
             parts = [p.text for p in resp.candidates[0].content.parts if hasattr(p, 'text')]
             return "\n".join(parts).strip()
         except:
             return ""
-
-def _short_err(e: Exception) -> str:
-    return str(e)[:200]
 
 # -------------------------
 # Core Gemini Logic
@@ -145,7 +138,7 @@ def _gemini_generate(prompt: str, request_id: str, image: Optional[Any] = None) 
     last_err = None
     for model_name in MODEL_FALLBACK:
         model = genai.GenerativeModel(model_name)
-        for attempt in range(1, 4):
+        for attempt in range(1, 3):
             try:
                 content = [prompt, image] if image else prompt
                 resp = model.generate_content(
@@ -156,12 +149,14 @@ def _gemini_generate(prompt: str, request_id: str, image: Optional[Any] = None) 
                 text = _extract_text(resp)
                 if text:
                     return _html_to_latex(text)
-                raise RuntimeError("Empty response")
+                raise RuntimeError("Gemini returned empty text.")
             except Exception as e:
                 last_err = e
-                print(f"[{request_id}] {model_name} attempt {attempt} fail: {_short_err(e)}")
+                print(f"[{request_id}] {model_name} attempt {attempt} failed: {str(e)}")
                 time.sleep(1)
-    raise RuntimeError(f"All models failed. Last error: {_short_err(last_err)}")
+    
+    # Isse error bubble up hokar post route tak jayega
+    raise last_err if last_err else RuntimeError("Unknown API Error")
 
 # -------------------------
 # Routes
@@ -187,8 +182,10 @@ def ask_text(payload: AskTextRequest):
         answer = _gemini_generate(prompt, request_id)
         return {"answer_text": answer}
     except Exception as e:
-        print(f"[{request_id}] ERROR: {str(e)}")
-        return {"answer_text": f"⚠️ Gemini error occurred. Request id: {request_id}"}
+        # DEBUG: Asli error ko frontend par bhejo
+        err_msg = str(e)
+        print(f"[{request_id}] ERROR: {traceback.format_exc()}")
+        return {"answer_text": f"⚠️ DEBUG ERROR: {err_msg} | ID: {request_id}"}
 
 @app.post("/ask-image")
 async def ask_image(
@@ -198,19 +195,11 @@ async def ask_image(
     language: str = "hinglish",
 ):
     request_id = str(uuid.uuid4())[:8]
-    if not PIL_AVAILABLE:
-        return {"answer_text": "⚠️ Pillow library missing in requirements.txt"}
-
     try:
         content = await file.read()
         img = Image.open(io.BytesIO(content)).convert("RGB")
-    except Exception as e:
-        return {"answer_text": f"⚠️ Image error: {str(e)}"}
-
-    prompt = _build_prompt("Solve the question from this image.", level, style, language)
-    try:
+        prompt = _build_prompt("Solve the question from this image.", level, style, language)
         answer = _gemini_generate(prompt, request_id, image=img)
         return {"answer_text": answer}
     except Exception as e:
-        print(f"[{request_id}] ERROR: {str(e)}")
-        return {"answer_text": f"⚠️ Gemini error occurred. Request id: {request_id}"}
+        return {"answer_text": f"⚠️ DEBUG ERROR: {str(e)} | ID: {request_id}"}
