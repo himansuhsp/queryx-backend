@@ -62,7 +62,6 @@ if ENV_MODEL:
 MODEL_FALLBACK += [
     "gemini-2.0-flash"
     "gemini-1.5-flash",
-    "gemini-1.5-pro",
 ]
 
 # -------------------------
