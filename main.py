@@ -87,19 +87,53 @@ def safe_eval(expr: str) -> str:
     return str(eval(expr, {"__builtins__": {}}))
 
 def build_prompt(q: str, level: str, style: str, lang: str) -> str:
-    return f"""
-You are QueryX, an expert JEE/NEET PCMB solver.
+    level = (level or "basic").lower()
+    style = (style or "detailed").lower()
+    lang = (lang or "hinglish").lower()
 
-Rules:
-- Start directly with solution
-- Use Markdown
-- Use LaTeX for formulas
-- Exam focused
-- Hinglish if asked
+    if style == "short":
+        max_steps = 6
+        max_lines = 18
+    else:
+        max_steps = 10
+        max_lines = 35
+
+    return f"""
+You are QueryX, a JEE/NEET PCMB problem solver.
+
+STRICT RULES (NO EXCEPTIONS):
+- No introduction, no conclusion.
+- No generic theory, no textbook explanation.
+- No assumptions. If data missing, write:
+  "Given data missing: ____" and STOP.
+- Use only formulas required for THIS question.
+- Do NOT mention diagrams/figures unless explicitly asked.
+- LaTeX only inside $...$ or $$...$$.
+- Steps must be short (1–2 lines max).
+
+MCQ RULE:
+- If options are given, calculate and match.
+- Final line must be ONLY:
+  Final: Option (A/B/C/D or 1/2/3/4)
+
+FORMAT (MANDATORY):
+1) Given:
+2) Formula:
+3) Substitute:
+4) Calculation:
+5) Final:
+
+Language:
+- Hinglish if requested, otherwise English.
+
+Limit:
+- Max steps: {max_steps}
+- Max lines: {max_lines}
 
 Question:
 {q}
 """.strip()
+
 
 def extract_text(resp) -> str:
     if getattr(resp, "text", None):
