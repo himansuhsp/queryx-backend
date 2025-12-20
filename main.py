@@ -60,7 +60,7 @@ if ENV_MODEL:
 
 # safe/stable order
 MODEL_FALLBACK += [
-    "gemini-2.0-flash"
+    "gemini-2.0-flash",
     "gemini-1.5-flash",
 ]
 
