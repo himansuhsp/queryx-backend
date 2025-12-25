@@ -303,6 +303,11 @@ Before responding, ensure:
 - Data assumption clearly stated if used
 - Output is exam-ready
 
+CRITICAL OUTPUT RULE:
+- NEVER mention Subject, Question Type, Conceptual, Law name, or classification
+- NEVER write headings like "Final Statement"
+- Start directly with the answer
+
 =================================================
 QUESTION
 =================================================
