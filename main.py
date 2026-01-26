@@ -6,10 +6,18 @@ import io
 from typing import Optional, Any
 
 from fastapi import FastAPI, UploadFile, File
+from fastapi import Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 from dotenv import load_dotenv
+APP_NAME="Queryx"
+app = FastAPI(title=APP_NAME)
+@app.options("/{path:path}")
+async def options_handler(path: str, request: Request):
+    return Response(status_code=200)
+
 
 import google.generativeai as genai
 
@@ -29,17 +37,29 @@ genai.configure(api_key=API_KEY)
 # -------------------------
 # FastAPI app
 # -------------------------
-app = FastAPI(title=APP_NAME)
+
 
 # -------------------------
 # 🔥 CORS (FINAL, SIMPLE, WORKING)
 # -------------------------
+
+ALLOWED_ORIGINS = [
+    "https://queryxai.com",
+    "https://www.queryxai.com",
+    "https://api.queryxai.com",
+    "http://localhost:3000",
+    "http://localhost:5173",
+    "null",  # IMPORTANT: android webview sometimes sends Origin: null
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],       # allow all (safe for now)
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
+    max_age=86400,
 )
 
 # -------------------------
